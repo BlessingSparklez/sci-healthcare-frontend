@@ -1,9 +1,10 @@
 'use client';
 
 import Link from 'next/link';
+import { notFound } from 'next/navigation';
 import { use, useEffect, useMemo, useState } from 'react';
 
-import { api, type Provider, type Service } from '@/lib/api';
+import { api, ApiError, type Provider, type Service } from '@/lib/api';
 import { formatUsdc, shortAddress, toAmountInput, toBaseUnits } from '@/lib/amounts';
 import { trackEvent } from '@/lib/analytics';
 import { beneficiaryRef, generateKey, localIdentity } from '@/lib/beneficiary';
@@ -42,6 +43,9 @@ export default function ClinicPage({
   const [txHash, setTxHash] = useState<string | null>(null);
   const [fundedId, setFundedId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // The address the API reported as missing, so a later address is never
+  // hidden by it.
+  const [missingAddress, setMissingAddress] = useState<string | null>(null);
 
   // The amount as base units, or null while the field is not a number.
   const baseAmount = useMemo(() => {
@@ -76,9 +80,11 @@ export default function ClinicPage({
   const currentQuote = quote && quote.amount === baseAmount ? quote : null;
 
   useEffect(() => {
+    let ignore = false;
     (async () => {
       try {
         const p = await api.provider(address);
+        if (ignore) return;
         setProvider(p);
         const first = p.services.find((s) => s.active !== false);
         if (first) {
@@ -86,9 +92,18 @@ export default function ClinicPage({
           setAmount(toAmountInput(first.price));
         }
       } catch (err) {
+        if (ignore) return;
+        // An unknown clinic is a missing page, not an API failure.
+        if (err instanceof ApiError && err.status === 404) {
+          setMissingAddress(address);
+          return;
+        }
         setLoadError(err instanceof Error ? err.message : 'Failed to load clinic');
       }
     })();
+    return () => {
+      ignore = true;
+    };
   }, [address]);
 
   async function fund() {
@@ -136,6 +151,9 @@ export default function ClinicPage({
     }
   }
 
+  // Called while rendering (not from the effect) so Next can swap in
+  // not-found.tsx; throwing inside the async callback would be uncaught.
+  if (missingAddress === address) notFound();
   if (loadError) return <Alert>{loadError}</Alert>;
   if (!provider) {
     return <p className="text-sm text-[var(--color-ink-soft)]">Loading clinic…</p>;

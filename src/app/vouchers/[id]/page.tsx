@@ -1,9 +1,10 @@
 'use client';
 
 import Link from 'next/link';
+import { notFound } from 'next/navigation';
 import { use, useCallback, useEffect, useState } from 'react';
 
-import { api, type Receipt, type Voucher } from '@/lib/api';
+import { api, ApiError, type Receipt, type Voucher } from '@/lib/api';
 import { formatDate, formatUsdc, shortAddress } from '@/lib/amounts';
 import { config, explorerContract } from '@/lib/config';
 import { voucherTimeline, type StepState } from '@/lib/timeline';
@@ -23,6 +24,8 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
   const { address } = useWallet();
   const [v, setV] = useState<Loaded | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The id the API reported as missing, so a later id is never hidden by it.
+  const [missingId, setMissingId] = useState<string | null>(null);
 
   const [reloads, setReloads] = useState(0);
   const refresh = useCallback(() => setReloads((n) => n + 1), []);
@@ -34,7 +37,13 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
         const res = await api.voucher(id);
         if (!ignore) setV(res);
       } catch (err) {
-        if (!ignore) setError(err instanceof Error ? err.message : 'Failed to load voucher');
+        if (ignore) return;
+        // A mistyped shared link is a missing page, not an API failure.
+        if (err instanceof ApiError && err.status === 404) {
+          setMissingId(id);
+          return;
+        }
+        setError(err instanceof Error ? err.message : 'Failed to load voucher');
       }
     })();
     return () => {
@@ -42,6 +51,9 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
     };
   }, [id, reloads]);
 
+  // Called while rendering (not from the effect) so Next can swap in
+  // not-found.tsx; throwing inside the async callback would be uncaught.
+  if (missingId === id) notFound();
   if (error) return <Alert>{error}</Alert>;
   if (!v) return <p className="text-sm text-[var(--color-ink-soft)]">Loading voucher…</p>;
 

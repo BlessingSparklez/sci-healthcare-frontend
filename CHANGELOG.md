@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Root `error.tsx` with a retry button and a shared `not-found.tsx` in the app's style, plus a light loading skeleton for route transitions.
 - Visual regression snapshots for the six routes (`/`, `/clinics/[address]`, `/my`, `/clinic`, `/attest`, `/vouchers/[id]`) at desktop and 390px widths, with the API mocked, the clock frozen and RPC blocked. Runs in CI; regenerate with `npm run test:visual:update`.
 - End-to-end tests for the fund, claim, attest, dispute and refund flows at desktop and 390px widths, with a mock wallet and mock RPC behind `window.__SCI_MOCK_WALLET__` / `window.__SCI_MOCK_RPC__` (test-only, no keys, production behaviour unchanged). Runs in CI as `npm run test:e2e`.
 - Cookieless usage analytics (Plausible) behind `NEXT_PUBLIC_PLAUSIBLE_DOMAIN`; unset disables it entirely. Pageviews use normalized routes and funnel events carry names only, so no addresses, references or amounts ever leave the browser.
@@ -24,6 +25,7 @@
 - Claimed vouchers say when they become refundable if no attester confirms.
 
 ### Fixed
+- An unknown voucher or clinic (for example `/vouchers/99999`) showed the raw API error string; the voucher and clinic pages now call `notFound()` on a 404 and show a friendly page with a way back.
 - A missing USDC trustline was reported as "The dispute window is still open", and an insufficient balance as "not in the right state": token errors come through with the token's own error numbers, which were looked up in the voucher table. Token messages are now recognised first.
 - Clinic desk treated pending, suspended and unregistered clinics alike, so a clinic awaiting verification was offered the Register form again, which then failed. Status is now read from the registry and each state gets its own message.
 - Services priced at 1,000 USDC or more could not be funded: the amount field was pre-filled with a thousands separator the parser rejects.
