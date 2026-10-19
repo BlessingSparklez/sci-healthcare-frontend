@@ -44,6 +44,20 @@ export const CLINIC = {
   services: SERVICES,
 };
 
+/** Same clinic, with coordinates published in its metadata (map view). */
+export const LOCATED_CLINIC = {
+  ...CLINIC,
+  location: { lat: 6.6018, lng: 3.3515 },
+};
+
+/** A second clinic that has not published a location. */
+export const UNLOCATED_CLINIC = {
+  ...CLINIC,
+  address: ATTESTER,
+  name: 'Lekki Care Centre',
+  services: SERVICES.slice(0, 1),
+};
+
 function baseVoucher(id: string, overrides: Record<string, unknown>) {
   return {
     id,

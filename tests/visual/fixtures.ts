@@ -62,6 +62,8 @@ export const providersList = {
       country: 'NG',
       status: 'Active',
       registeredAt: '2026-04-01T00:00:00.000Z',
+      // Published coordinates (contracts #10 metadata): appears on the map.
+      location: { lat: 6.6018, lng: 3.3515 },
       services,
     },
     {
@@ -70,6 +72,7 @@ export const providersList = {
       country: 'NG',
       status: 'Active',
       registeredAt: '2026-04-10T00:00:00.000Z',
+      // No published location: listed below the map instead.
       services: services.slice(0, 2),
     },
   ],
@@ -142,7 +145,58 @@ export async function mockApi(page: Page): Promise<void> {
         body: JSON.stringify(body),
       });
 
-    if (parts[0] === 'stats') return json(stats);
+    if (parts[0] === 'stats') {
+      if (parts[1] === 'daily') {
+        return json({
+          days: 30,
+          from: '2026-05-16T00:00:00.000Z',
+          to: '2026-06-15T00:00:00.000Z',
+          series: [
+            {
+              date: '2026-06-01',
+              funded: { count: 3, amount: '90000000' },
+              settled: { count: 2, amount: '60000000' },
+              refunded: { count: 0, amount: '0' },
+            },
+            {
+              date: '2026-06-10',
+              funded: { count: 9, amount: '160000000' },
+              settled: { count: 3, amount: '190000000' },
+              refunded: { count: 0, amount: '0' },
+            },
+          ],
+        });
+      }
+      return json(stats);
+    }
+
+    if (parts[0] === 'attesters') {
+      return json({
+        total: 2,
+        limit: 50,
+        offset: 0,
+        attesters: [
+          {
+            address: 'GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAA',
+            active: true,
+            addedAt: '2026-01-15T10:00:00.000Z',
+            removedAt: null,
+            attestations: 14,
+            name: 'Red Cross Clinical Inspector',
+            organisation: 'International Medical Verification',
+          },
+          {
+            address: 'GBTYQNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVBBB',
+            active: true,
+            addedAt: '2026-02-01T10:00:00.000Z',
+            removedAt: null,
+            attestations: 8,
+            name: 'State Health Board Auditor',
+            organisation: 'Public Health Oversight Agency',
+          },
+        ],
+      });
+    }
 
     if (parts[0] === 'receipts') {
       return json({ total: 0, totalSpendDisplay: '0.00', receipts: [] });
@@ -159,6 +213,11 @@ export async function mockApi(page: Page): Promise<void> {
     }
 
     if (parts[0] === 'vouchers') {
+      // /vouchers/<id>/events — a pre-#13 indexer answers 404, so the
+      // timeline snapshot shows dates without "view transaction" links.
+      if (parts.length === 3 && parts[2] === 'events') {
+        return json({ message: 'Not found' }, 404);
+      }
       // /vouchers/<id>
       if (parts.length === 2) {
         if (parts[1] === VOUCHER_ID) return json(voucherDetail);

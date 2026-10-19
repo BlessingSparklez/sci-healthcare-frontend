@@ -1,12 +1,46 @@
-import { config } from './config';
+import { config, isTestnet } from './config';
+import {
+  FaucetClient,
+  RegistryClient,
+  VoucherClient,
+} from './contracts';
 import { arg, invokeContract, readContract, type SignFn } from './stellar';
+
+export { RegistryClient, VoucherClient, FaucetClient } from './contracts';
 
 /**
  * Typed wrappers for every contract call the app makes.
  *
- * Argument order must match the Rust function signatures exactly; Soroban
- * matches positionally, not by name.
+ * Calls route through generated TypeScript contract bindings (#62), which
+ * enforce type safety and exact argument names/order from the Soroban contract specs.
+ *
+ * The wrappers maintain the same exported API and return shapes so callers across
+ * the app remain unchanged.
  */
+
+function getVoucherClient() {
+  return new VoucherClient({
+    contractId: config.contracts.voucher,
+    networkPassphrase: config.networkPassphrase,
+    rpcUrl: config.rpcUrl,
+  });
+}
+
+function getRegistryClient() {
+  return new RegistryClient({
+    contractId: config.contracts.registry,
+    networkPassphrase: config.networkPassphrase,
+    rpcUrl: config.rpcUrl,
+  });
+}
+
+function getFaucetClient() {
+  return new FaucetClient({
+    contractId: config.contracts.faucet,
+    networkPassphrase: config.networkPassphrase,
+    rpcUrl: config.rpcUrl,
+  });
+}
 
 export const voucher = {
   /** create_voucher(funder, beneficiary_ref, provider, service_code, amount, expires_at) -> u64 */
@@ -21,17 +55,22 @@ export const voucher = {
     },
     sign: SignFn,
   ) {
+    const client = getVoucherClient();
+    const clean = params.beneficiaryRef.startsWith('0x')
+      ? params.beneficiaryRef.slice(2)
+      : params.beneficiaryRef;
+    const args = client.spec.funcArgsToScVals('create_voucher', {
+      funder: params.funder,
+      beneficiary_ref: Buffer.from(clean, 'hex'),
+      provider: params.provider,
+      service_code: params.serviceCode,
+      amount: params.amount,
+      expires_at: BigInt(params.expiresAt),
+    });
     return invokeContract(
       config.contracts.voucher,
       'create_voucher',
-      [
-        arg.address(params.funder),
-        arg.bytes32(params.beneficiaryRef),
-        arg.address(params.provider),
-        arg.u32(params.serviceCode),
-        arg.i128(params.amount),
-        arg.u64(params.expiresAt),
-      ],
+      args,
       params.funder,
       sign,
     );
@@ -39,64 +78,58 @@ export const voucher = {
 
   /** claim(provider, voucher_id) */
   async claim(provider: string, voucherId: string, sign: SignFn) {
-    return invokeContract(
-      config.contracts.voucher,
-      'claim',
-      [arg.address(provider), arg.u64(BigInt(voucherId))],
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('claim', {
       provider,
-      sign,
-    );
+      voucher_id: BigInt(voucherId),
+    });
+    return invokeContract(config.contracts.voucher, 'claim', args, provider, sign);
   },
 
   /** attest(attester, voucher_id) */
   async attest(attester: string, voucherId: string, sign: SignFn) {
-    return invokeContract(
-      config.contracts.voucher,
-      'attest',
-      [arg.address(attester), arg.u64(BigInt(voucherId))],
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('attest', {
       attester,
-      sign,
-    );
+      voucher_id: BigInt(voucherId),
+    });
+    return invokeContract(config.contracts.voucher, 'attest', args, attester, sign);
   },
 
   /** dispute(funder, voucher_id, reason_code) */
   async dispute(funder: string, voucherId: string, reasonCode: number, sign: SignFn) {
-    return invokeContract(
-      config.contracts.voucher,
-      'dispute',
-      [arg.address(funder), arg.u64(BigInt(voucherId)), arg.u32(reasonCode)],
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('dispute', {
       funder,
-      sign,
-    );
+      voucher_id: BigInt(voucherId),
+      reason_code: reasonCode,
+    });
+    return invokeContract(config.contracts.voucher, 'dispute', args, funder, sign);
   },
 
   /** settle(voucher_id) — permissionless, so any address may submit it. */
   async settle(caller: string, voucherId: string, sign: SignFn) {
-    return invokeContract(
-      config.contracts.voucher,
-      'settle',
-      [arg.u64(BigInt(voucherId))],
-      caller,
-      sign,
-    );
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('settle', {
+      voucher_id: BigInt(voucherId),
+    });
+    return invokeContract(config.contracts.voucher, 'settle', args, caller, sign);
   },
 
   /** refund(voucher_id) — permissionless. */
   async refund(caller: string, voucherId: string, sign: SignFn) {
-    return invokeContract(
-      config.contracts.voucher,
-      'refund',
-      [arg.u64(BigInt(voucherId))],
-      caller,
-      sign,
-    );
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('refund', {
+      voucher_id: BigInt(voucherId),
+    });
+    return invokeContract(config.contracts.voucher, 'refund', args, caller, sign);
   },
 
   /** quote(amount) -> (fee, net) */
   async quote(amount: bigint): Promise<[bigint, bigint]> {
-    return readContract<[bigint, bigint]>(config.contracts.voucher, 'quote', [
-      arg.i128(amount),
-    ]);
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('quote', { amount });
+    return readContract<[bigint, bigint]>(config.contracts.voucher, 'quote', args);
   },
 };
 
@@ -112,10 +145,16 @@ export const registry = {
     country: string,
     sign: SignFn,
   ) {
+    const client = getRegistryClient();
+    const args = client.spec.funcArgsToScVals('register_provider', {
+      owner,
+      name,
+      country,
+    });
     return invokeContract(
       config.contracts.registry,
       'register_provider',
-      [arg.address(owner), arg.string(name), arg.string(country)],
+      args,
       owner,
       sign,
     );
@@ -129,10 +168,17 @@ export const registry = {
     price: bigint,
     sign: SignFn,
   ) {
+    const client = getRegistryClient();
+    const args = client.spec.funcArgsToScVals('upsert_service', {
+      provider_addr: provider,
+      code,
+      label,
+      price,
+    });
     return invokeContract(
       config.contracts.registry,
       'upsert_service',
-      [arg.address(provider), arg.u32(code), arg.string(label), arg.i128(price)],
+      args,
       provider,
       sign,
     );
@@ -140,10 +186,15 @@ export const registry = {
 
   /** remove_service(provider_addr, code). Funded vouchers are unaffected. */
   async removeService(provider: string, code: number, sign: SignFn) {
+    const client = getRegistryClient();
+    const args = client.spec.funcArgsToScVals('remove_service', {
+      provider_addr: provider,
+      code,
+    });
     return invokeContract(
       config.contracts.registry,
       'remove_service',
-      [arg.address(provider), arg.u32(code)],
+      args,
       provider,
       sign,
     );
@@ -156,10 +207,14 @@ export const registry = {
    */
   async providerStatus(address: string): Promise<ProviderStanding | null> {
     try {
+      const client = getRegistryClient();
+      const args = client.spec.funcArgsToScVals('get_provider', {
+        provider_addr: address,
+      });
       const p = await readContract<{ status: number | string }>(
         config.contracts.registry,
         'get_provider',
-        [arg.address(address)],
+        args,
       );
       return typeof p.status === 'string'
         ? (p.status as ProviderStanding)
@@ -172,35 +227,47 @@ export const registry = {
   },
 
   async isActiveProvider(address: string): Promise<boolean> {
-    return readContract<boolean>(config.contracts.registry, 'is_active_provider', [
-      arg.address(address),
-    ]);
+    const client = getRegistryClient();
+    const args = client.spec.funcArgsToScVals('is_active_provider', {
+      provider_addr: address,
+    });
+    return readContract<boolean>(config.contracts.registry, 'is_active_provider', args);
   },
 
   async isAttester(address: string): Promise<boolean> {
-    return readContract<boolean>(config.contracts.registry, 'is_attester', [
-      arg.address(address),
-    ]);
+    const client = getRegistryClient();
+    const args = client.spec.funcArgsToScVals('is_attester', {
+      addr: address,
+    });
+    return readContract<boolean>(config.contracts.registry, 'is_attester', args);
   },
 };
 
 export const faucet = {
-  enabled: (): boolean => Boolean(config.contracts.faucet),
+  // Testnet only, even if a faucet id leaks into a mainnet build: the
+  // contract mints demo USDC to anyone, which must never surface as real.
+  enabled: (): boolean => isTestnet && Boolean(config.contracts.faucet),
 
   /** drip(to) -> i128. Mints the daily amount of test USDC to `to`. */
   async drip(to: string, sign: SignFn) {
-    return invokeContract(config.contracts.faucet, 'drip', [arg.address(to)], to, sign);
+    const client = getFaucetClient();
+    const args = client.spec.funcArgsToScVals('drip', { to });
+    return invokeContract(config.contracts.faucet, 'drip', args, to, sign);
   },
 
   /** Ledger time (seconds) `to` may drip again, or 0 if it may now. */
   async nextDripAt(to: string): Promise<number> {
+    const client = getFaucetClient();
+    const args = client.spec.funcArgsToScVals('next_drip_at', { to });
     return Number(
-      await readContract<bigint>(config.contracts.faucet, 'next_drip_at', [arg.address(to)]),
+      await readContract<bigint>(config.contracts.faucet, 'next_drip_at', args),
     );
   },
 
   async amount(): Promise<bigint> {
-    const c = await readContract<{ amount: bigint }>(config.contracts.faucet, 'get_config');
+    const client = getFaucetClient();
+    const args = client.spec.funcArgsToScVals('get_config', {});
+    const c = await readContract<{ amount: bigint }>(config.contracts.faucet, 'get_config', args);
     return BigInt(c.amount);
   },
 };
@@ -209,7 +276,7 @@ export const usdc = {
   async balance(address: string): Promise<bigint> {
     if (!config.contracts.usdc) return 0n;
     return readContract<bigint>(config.contracts.usdc, 'balance', [
-      arg.address(address),
+      await arg.address(address),
     ]);
   },
 };

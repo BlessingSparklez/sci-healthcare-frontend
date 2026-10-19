@@ -1,15 +1,17 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useState } from 'react';
+import useSWR from 'swr';
 
-import { api, ApiError, type Service, type Voucher } from '@/lib/api';
 import { formatUsdc, toAmountInput, toBaseUnits } from '@/lib/amounts';
 import { explorerTx } from '@/lib/config';
 import { humaniseError, REGISTRY_ERRORS } from '@/lib/errors';
+import { useLiveUpdates, useProvider, useVouchers } from '@/lib/hooks';
 import { registry, type ProviderStanding } from '@/lib/protocol';
 import { useWallet } from '@/lib/wallet';
 import { VoucherRow } from '@/components/VoucherRow';
-import { Alert, Button, Card, Empty, ExplorerLink } from '@/components/ui';
+import { useToast } from '@/components/Toast';
+import { Button, Card, Empty, ExplorerLink } from '@/components/ui';
 
 /** null while loading; 'Unregistered' when the registry has no entry. */
 type Standing = ProviderStanding | 'Unregistered' | null;
@@ -28,16 +30,14 @@ const STANDING_TEXT: Record<Exclude<Standing, null>, string> = {
  *
  * A clinic self-registers here and is Pending until an administrator
  * activates it. Only then can it list services or receive vouchers.
+ *
+ * Uses SWR caching (#63) and live updates via SSE with polling fallback (#64).
  */
 export default function ClinicDeskPage() {
   const { address, signTransaction, connect } = useWallet();
 
-  const [standing, setStanding] = useState<Standing>(null);
-  const [services, setServices] = useState<Service[]>([]);
-  const [vouchers, setVouchers] = useState<Voucher[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [hash, setHash] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const toast = useToast();
 
   const [name, setName] = useState('');
   const [country, setCountry] = useState('');
@@ -47,55 +47,56 @@ export default function ClinicDeskPage() {
   // Delisting takes a second click, like disputing.
   const [confirmRemove, setConfirmRemove] = useState<number | null>(null);
 
-  const [reloads, setReloads] = useState(0);
-  const refresh = useCallback(() => setReloads((n) => n + 1), []);
+  // SWR cached reads (#63)
+  const { provider, mutate: mutateProvider } = useProvider(address);
+  const { vouchers, mutate: mutateVouchers } = useVouchers(
+    address ? { provider: address } : null,
+  );
+  const { data: status, mutate: mutateStatus } = useSWR(
+    address ? ['registry:status', address] : null,
+    () => registry.providerStatus(address!),
+  );
 
-  useEffect(() => {
-    if (!address) return;
-    // Ignore a response that lands after the wallet changed.
-    let ignore = false;
-    (async () => {
-      try {
-        const [status, catalogue, list] = await Promise.all([
-          registry.providerStatus(address),
-          // The indexer may not have seen a brand-new clinic yet.
-          api.provider(address).catch((err) => {
-            if (err instanceof ApiError && err.status === 404) return null;
-            throw err;
-          }),
-          api.vouchers({ provider: address }).catch(() => ({ vouchers: [] })),
-        ]);
-        if (ignore) return;
-        setStanding(status ?? 'Unregistered');
-        setServices((catalogue?.services ?? []).filter((s) => s.active !== false));
-        setVouchers(list.vouchers);
-      } catch (err) {
-        if (!ignore) setError(err instanceof Error ? err.message : 'Failed to load');
-      }
-    })();
-    return () => {
-      ignore = true;
-    };
-  }, [address, reloads]);
+  // Live SSE stream with automatic fallback to polling (#64)
+  useLiveUpdates({ providerAddress: address ?? undefined });
+
+  const refreshAll = () => {
+    void mutateProvider();
+    void mutateVouchers();
+    void mutateStatus();
+  };
+
+  const standing: Standing =
+    status !== undefined
+      ? (status ?? 'Unregistered')
+      : provider
+        ? provider.status
+        : null;
+
+  const services = (provider?.services ?? []).filter((s) => s.active !== false);
 
   async function submit(fn: () => Promise<{ hash: string }>, table = REGISTRY_ERRORS) {
     if (!address) return void connect();
     setBusy(true);
-    setError(null);
-    setHash(null);
     try {
       const res = await fn();
-      setHash(res.hash);
       setConfirmRemove(null);
-      refresh();
+      refreshAll();
+      toast.success(
+        <>
+          Submitted.{' '}
+          <ExplorerLink href={explorerTx(res.hash)}>View transaction</ExplorerLink>{' '}
+          Lists update once the indexer catches up.
+        </>,
+      );
     } catch (err) {
-      setError(humaniseError(err, table));
+      toast.error(humaniseError(err, table));
     } finally {
       setBusy(false);
     }
   }
 
-  function edit(s: Service) {
+  function edit(s: { code: number; label: string; price: string }) {
     setCode(String(s.code));
     setLabel(s.label);
     setPrice(toAmountInput(s.price));
@@ -115,14 +116,6 @@ export default function ClinicDeskPage() {
           {standing === null ? 'Checking registration…' : STANDING_TEXT[standing]}
         </p>
       </div>
-
-      {error && <Alert>{error}</Alert>}
-      {hash && (
-        <Alert kind="success">
-          Submitted. <ExplorerLink href={explorerTx(hash)}>View transaction</ExplorerLink>{' '}
-          Lists update once the indexer catches up.
-        </Alert>
-      )}
 
       {standing === 'Unregistered' && (
         <Card className="space-y-3 p-5">
@@ -275,7 +268,12 @@ export default function ClinicDeskPage() {
         {vouchers.length === 0 && <Empty>No vouchers for this clinic yet.</Empty>}
         <div className="space-y-3">
           {vouchers.map((v) => (
-            <VoucherRow key={v.id} v={v} actions={['claim', 'settle']} onDone={refresh} />
+            <VoucherRow
+              key={v.id}
+              v={v}
+              actions={['claim', 'settle']}
+              onDone={refreshAll}
+            />
           ))}
         </div>
       </section>

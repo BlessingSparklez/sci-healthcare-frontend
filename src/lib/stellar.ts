@@ -1,22 +1,142 @@
-import {
-  Address,
-  BASE_FEE,
-  Contract,
-  nativeToScVal,
-  rpc,
-  scValToNative,
-  TransactionBuilder,
-  xdr,
-} from '@stellar/stellar-sdk';
+import type { xdr } from '@stellar/stellar-sdk';
 
 import { config } from './config';
-import { isMockRpc, recordMockCall } from './e2e-seam';
+import { isMockRpc, mockRpcDelayMs, recordMockCall } from './e2e-seam';
+import { beginPendingTransaction } from './pending-tx';
 
-export const server = new rpc.Server(config.rpcUrl, {
-  allowHttp: config.rpcUrl.startsWith('http://'),
-});
+/**
+ * Stellar SDK access.
+ *
+ * The SDK (~large) is split out of the initial bundle: every page that only
+ * reads the indexer never imports it. It loads on demand the first time a
+ * write is simulated, submitted or read via `simulateTransaction`.
+ * Static `import type` above is erased at build time and costs nothing.
+ */
+
+type Sdk = typeof import('@stellar/stellar-sdk');
+
+let sdkPromise: Promise<Sdk> | null = null;
+function loadSdk(): Promise<Sdk> {
+  if (!sdkPromise) sdkPromise = import('@stellar/stellar-sdk');
+  return sdkPromise;
+}
+
+type RpcServer = InstanceType<Sdk['rpc']['Server']>;
+let cachedServer: RpcServer | null = null;
+
+async function getServer(): Promise<RpcServer> {
+  if (cachedServer) return cachedServer;
+  const { rpc } = await loadSdk();
+  cachedServer = new rpc.Server(config.rpcUrl, {
+    allowHttp: config.rpcUrl.startsWith('http://'),
+  });
+  return cachedServer;
+}
 
 export type SignFn = (xdrString: string) => Promise<string>;
+
+export const MIN_FEE_BUFFER_XLM = 1.0;
+
+export interface SpendableXlmInfo {
+  rawBalance: number;
+  minBalance: number;
+  spendable: number;
+  isLowForFees: boolean;
+}
+
+interface HorizonBalanceLine {
+  asset_type: string;
+  balance: string;
+}
+
+interface HorizonAccountRecord {
+  balances: HorizonBalanceLine[];
+  subentry_count: number;
+}
+
+function horizonBaseUrl(): string {
+  if (config.network === 'public') return 'https://horizon.stellar.org';
+  if (config.network === 'futurenet') return 'https://horizon-futurenet.stellar.org';
+  return 'https://horizon-testnet.stellar.org';
+}
+
+/**
+ * Checks whether an account exists on the network (is funded with XLM).
+ * Soroban RPC returns 404 / account not found for brand new accounts.
+ */
+export async function checkAccountFunded(address: string): Promise<boolean> {
+  if (isMockRpc()) {
+    if (
+      typeof window !== 'undefined' &&
+      (window as unknown as { __SCI_UNFUNDED_ACCOUNT__?: boolean })
+        .__SCI_UNFUNDED_ACCOUNT__
+    ) {
+      return false;
+    }
+    return true;
+  }
+  try {
+    const server = await getServer();
+    await server.getAccount(address);
+    return true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/not found|404/i.test(message)) {
+      return false;
+    }
+    return true;
+  }
+}
+
+/**
+ * Reads native balance and subentries to compute spendable XLM balance (#61).
+ * In Stellar, min balance = (2 + subentries) * base_reserve (0.5 XLM).
+ * Returns isLowForFees=true when spendable XLM is below MIN_FEE_BUFFER_XLM.
+ */
+export async function getAccountSpendableBalance(
+  address: string,
+): Promise<SpendableXlmInfo | null> {
+  if (isMockRpc()) {
+    if (
+      typeof window !== 'undefined' &&
+      (window as unknown as { __SCI_LOW_XLM_BALANCE__?: boolean })
+        .__SCI_LOW_XLM_BALANCE__
+    ) {
+      return {
+        rawBalance: 1.0,
+        minBalance: 1.0,
+        spendable: 0.0,
+        isLowForFees: true,
+      };
+    }
+    return {
+      rawBalance: 100.0,
+      minBalance: 1.0,
+      spendable: 99.0,
+      isLowForFees: false,
+    };
+  }
+
+  try {
+    const url = `${horizonBaseUrl()}/accounts/${address}`;
+    const res = await fetch(url, { headers: { accept: 'application/json' } });
+    if (!res.ok) return null;
+    const account = (await res.json()) as HorizonAccountRecord;
+    const nativeEntry = account.balances.find((b) => b.asset_type === 'native');
+    const rawBalance = nativeEntry ? parseFloat(nativeEntry.balance) : 0;
+    const subentries = account.subentry_count ?? 0;
+    const minBalance = (2 + subentries) * 0.5;
+    const spendable = Math.max(0, rawBalance - minBalance);
+    return {
+      rawBalance,
+      minBalance,
+      spendable,
+      isLowForFees: spendable < MIN_FEE_BUFFER_XLM,
+    };
+  } catch {
+    return null;
+  }
+}
 
 /** How long to wait for a submitted transaction to reach a final status. */
 const CONFIRM_TIMEOUT_MS = 45_000;
@@ -36,15 +156,40 @@ export async function invokeContract(
   walletAddress: string,
   sign: SignFn,
 ): Promise<{ hash: string; returnValue: unknown }> {
+  // The whole round trip counts as pending: while it runs, the app warns
+  // before the tab is closed or reloaded (see pending-tx.ts and
+  // PendingTransactionGuard).
+  const finish = beginPendingTransaction();
+  try {
+    return await invoke(contractId, method, args, walletAddress, sign);
+  } finally {
+    finish();
+  }
+}
+
+async function invoke(
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[],
+  walletAddress: string,
+  sign: SignFn,
+): Promise<{ hash: string; returnValue: unknown }> {
   // Playwright end-to-end tests (see e2e-seam.ts): record the invocation and
   // return a canned submission instead of building, simulating and sending
   // a real transaction. Crafting Soroban simulation payloads over HTTP
   // would couple the tests to SDK internals; this keeps the same
   // `{ hash, returnValue }` shape the UI consumes.
   if (isMockRpc()) {
-    recordMockCall({ kind: 'invoke', contractId, method });
+    recordMockCall({ kind: 'invoke', contractId, method }, recordArgs(args));
+    // A test can keep a write in flight to observe the unload guard.
+    const delay = mockRpcDelayMs();
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
     return { hash: 'ab'.repeat(32), returnValue: mockReturnValue(method) };
   }
+
+  const { BASE_FEE, Contract, rpc, TransactionBuilder, scValToNative } =
+    await loadSdk();
+  const server = await getServer();
 
   const account = await server.getAccount(walletAddress);
   const contract = new Contract(contractId);
@@ -83,7 +228,13 @@ export async function invokeContract(
   };
 }
 
-async function waitForTransaction(hash: string): Promise<rpc.Api.GetSuccessfulTransactionResponse> {
+async function waitForTransaction(
+  hash: string,
+): Promise<
+  import('@stellar/stellar-sdk').rpc.Api.GetSuccessfulTransactionResponse
+> {
+  const { rpc } = await loadSdk();
+  const server = await getServer();
   const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
@@ -110,13 +261,16 @@ export async function readContract<T>(
   args: xdr.ScVal[] = [],
 ): Promise<T> {
   if (isMockRpc()) {
-    recordMockCall({ kind: 'read', contractId, method });
+    recordMockCall({ kind: 'read', contractId, method }, recordArgs(args));
     return mockReadResult<T>(method, args);
   }
 
+  const { BASE_FEE, Account, Contract, rpc, TransactionBuilder, scValToNative } =
+    await loadSdk();
+  const server = await getServer();
+
   const contract = new Contract(contractId);
   // A well-formed but unfunded account is enough to simulate a read.
-  const { Account } = await import('@stellar/stellar-sdk');
   const dummy = new Account(
     'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
     '0',
@@ -138,6 +292,15 @@ export async function readContract<T>(
 // ----- end-to-end test doubles (see e2e-seam.ts) -----
 
 /** create_voucher returns the new id as u64; every other write returns nothing. */
+/**
+ * The arguments of a mocked call as base64 XDR, so Playwright can assert the
+ * exact values a contract call carried — the `args` beside the recorded
+ * calls in e2e-seam.ts.
+ */
+function recordArgs(args: xdr.ScVal[]): string[] {
+  return args.map((a) => a.toXDR('base64'));
+}
+
 function mockReturnValue(method: string): unknown {
   if (method === 'create_voucher') return 7n;
   return null;
@@ -149,10 +312,15 @@ function mockReturnValue(method: string): unknown {
  * clinic and attester in their working states; the faucet reads give the
  * connected wallet a balance. Anything else throws so a missing double
  * fails loudly instead of rendering a confusing empty state.
+ *
+ * The SDK is loaded lazily even here: decoding the quote amount needs
+ * `scValToNative`, but mock mode is test-only so the extra chunk is never
+ * part of the production read-only bundle.
  */
-function mockReadResult<T>(method: string, args: xdr.ScVal[]): T {
+async function mockReadResult<T>(method: string, args: xdr.ScVal[]): Promise<T> {
   switch (method) {
     case 'quote': {
+      const { scValToNative } = await loadSdk();
       const amount = scValToNative(args[0]) as bigint;
       return [0n, amount] as unknown as T;
     }
@@ -177,20 +345,46 @@ function mockReadResult<T>(method: string, args: xdr.ScVal[]): T {
 // Soroban is strict about numeric widths. Passing a JS number where the
 // contract expects u64 or i128 produces a confusing XDR error, so each
 // encoder below is explicit about its type.
+//
+// Async on purpose: encoding needs the SDK, and awaiting `import()` keeps
+// the SDK in a separate chunk that read-only pages never download. Callers
+// `await` each encoder before `invokeContract`/`readContract`.
 
 export const arg = {
-  address: (v: string): xdr.ScVal => Address.fromString(v).toScVal(),
-  u32: (v: number): xdr.ScVal => nativeToScVal(v, { type: 'u32' }),
-  u64: (v: bigint | number): xdr.ScVal => nativeToScVal(BigInt(v), { type: 'u64' }),
-  i128: (v: bigint | string): xdr.ScVal => nativeToScVal(BigInt(v), { type: 'i128' }),
-  string: (v: string): xdr.ScVal => nativeToScVal(v, { type: 'string' }),
-  symbol: (v: string): xdr.ScVal => nativeToScVal(v, { type: 'symbol' }),
-  bytes32: (hex: string): xdr.ScVal => {
+  address: async (v: string): Promise<xdr.ScVal> => {
+    const { Address } = await loadSdk();
+    return Address.fromString(v).toScVal();
+  },
+  u32: async (v: number): Promise<xdr.ScVal> => {
+    const { nativeToScVal } = await loadSdk();
+    return nativeToScVal(v, { type: 'u32' });
+  },
+  u64: async (v: bigint | number): Promise<xdr.ScVal> => {
+    const { nativeToScVal } = await loadSdk();
+    return nativeToScVal(BigInt(v), { type: 'u64' });
+  },
+  i128: async (v: bigint | string): Promise<xdr.ScVal> => {
+    const { nativeToScVal } = await loadSdk();
+    return nativeToScVal(BigInt(v), { type: 'i128' });
+  },
+  string: async (v: string): Promise<xdr.ScVal> => {
+    const { nativeToScVal } = await loadSdk();
+    return nativeToScVal(v, { type: 'string' });
+  },
+  symbol: async (v: string): Promise<xdr.ScVal> => {
+    const { nativeToScVal } = await loadSdk();
+    return nativeToScVal(v, { type: 'symbol' });
+  },
+  bytes32: async (hex: string): Promise<xdr.ScVal> => {
+    const { xdr } = await loadSdk();
     const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
     if (!/^[0-9a-fA-F]{64}$/.test(clean)) {
       throw new Error('Beneficiary reference must be 64 hex characters');
     }
     return xdr.ScVal.scvBytes(Buffer.from(clean, 'hex'));
   },
-  bool: (v: boolean): xdr.ScVal => xdr.ScVal.scvBool(v),
+  bool: async (v: boolean): Promise<xdr.ScVal> => {
+    const { xdr } = await loadSdk();
+    return xdr.ScVal.scvBool(v);
+  },
 };

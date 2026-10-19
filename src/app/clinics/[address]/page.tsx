@@ -1,23 +1,60 @@
 'use client';
 
 import Link from 'next/link';
-import { notFound } from 'next/navigation';
 import { use, useEffect, useMemo, useState } from 'react';
 
-import { api, ApiError, type Provider, type Service } from '@/lib/api';
-import { formatUsdc, shortAddress, toAmountInput, toBaseUnits } from '@/lib/amounts';
+import { notFound } from 'next/navigation';
+
+import { ApiError, type Service } from '@/lib/api';
+import {
+  formatDate,
+  formatUsdc,
+  toAmountInput,
+  toBaseUnits,
+} from '@/lib/amounts';
 import { trackEvent } from '@/lib/analytics';
 import { beneficiaryRef, generateKey, localIdentity } from '@/lib/beneficiary';
+import { invalidateVouchers, useProvider, useVouchers } from '@/lib/hooks';
 import { useSavedIdentity } from '@/lib/useSavedIdentity';
 import { config, explorerTx } from '@/lib/config';
 import { humaniseError, VOUCHER_ERRORS } from '@/lib/errors';
+import {
+  EXPIRY_OPTIONS,
+  expiresAtFor,
+  minExpiryDate,
+  type ExpiryChoice,
+} from '@/lib/expiry';
 import { voucher } from '@/lib/protocol';
 import { useWallet } from '@/lib/wallet';
+import { SavedPatientControls } from '@/components/SavedPatientControls';
 import { TestUsdc } from '@/components/TestUsdc';
+import { CopyValue } from '@/components/CopyValue';
+import { useToast } from '@/components/Toast';
 import { Alert, Button, Card, ExplorerLink, Field } from '@/components/ui';
 
-/** How long the patient has to attend before the funder can refund. */
-const EXPIRY_OPTIONS = [14, 30, 60, 90] as const;
+/**
+ * Registry status in the words a funder reads. A funder choosing a clinic
+ * needs to know it is verified, and an unknown status is shown as such
+ * rather than assumed verified.
+ */
+const STATUS_BADGES: Record<string, { label: string; className: string }> = {
+  Active: {
+    label: 'Verified',
+    className: 'bg-emerald-50 text-emerald-700 ring-emerald-200',
+  },
+  Pending: {
+    label: 'Verification pending',
+    className: 'bg-amber-50 text-amber-800 ring-amber-200',
+  },
+  Suspended: {
+    label: 'Suspended',
+    className: 'bg-red-50 text-red-700 ring-red-200',
+  },
+};
+const UNKNOWN_STATUS = {
+  label: 'Status unknown',
+  className: 'bg-slate-100 text-slate-600 ring-slate-200',
+};
 
 export default function ClinicPage({
   params,
@@ -27,25 +64,35 @@ export default function ClinicPage({
   const { address } = use(params);
   const { address: wallet, signTransaction, connect } = useWallet();
 
-  const [provider, setProvider] = useState<Provider | null>(null);
-  const [selected, setSelected] = useState<Service | null>(null);
+  const { provider, error: loadError, rawError: loadRawError } = useProvider(address);
+  const [selectedOverride, setSelectedOverride] = useState<Service | null>(null);
+  const firstActive = provider?.services.find((s) => s.active !== false) ?? null;
+  const selected = selectedOverride ?? firstActive;
+
   const saved = useSavedIdentity();
   // null until the user types, so the saved values show through.
   const [identifierDraft, setIdentifier] = useState<string | null>(null);
   const [secretDraft, setSecret] = useState<string | null>(null);
   const identifier = identifierDraft ?? saved.identifier;
   const secret = secretDraft ?? saved.key;
-  const [amount, setAmount] = useState('');
-  const [expiryDays, setExpiryDays] = useState<number>(30);
+  const [amountOverride, setAmountOverride] = useState<string | null>(null);
+  const amount = amountOverride ?? (selected ? toAmountInput(selected.price) : '');
+  const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(30);
+  const [customExpiry, setCustomExpiry] = useState('');
   const [generatedKey, setGeneratedKey] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [txHash, setTxHash] = useState<string | null>(null);
-  const [fundedId, setFundedId] = useState<string | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  // The address the API reported as missing, so a later address is never
-  // hidden by it.
-  const [missingAddress, setMissingAddress] = useState<string | null>(null);
+  const toast = useToast();
+
+  // Track record for funders: how many vouchers this clinic has settled. The
+  // count is filtered server-side, so it stays right as the list grows, and
+  // it simply goes unrendered if the indexer cannot answer. One row is enough
+  // for a total — clinic connections are often metered.
+  const {
+    total: settledCount,
+    isLoading: loadingSettled,
+    error: settledError,
+  } = useVouchers({ provider: address, status: 'Settled', limit: 1 });
 
   // The amount as base units, or null while the field is not a number.
   const baseAmount = useMemo(() => {
@@ -78,45 +125,34 @@ export default function ClinicPage({
     };
   }, [baseAmount]);
   const currentQuote = quote && quote.amount === baseAmount ? quote : null;
+  const reviewAmount = baseAmount === null ? '—' : formatUsdc(baseAmount);
+  const reviewFee = currentQuote ? formatUsdc(currentQuote.fee) : '—';
+  const reviewNet = currentQuote ? formatUsdc(currentQuote.net) : '—';
+  const maskedSecret = secret
+    ? secret.length <= 8
+      ? '••••'
+      : `${secret.slice(0, 4)}••••${secret.slice(-4)}`
+    : '—';
 
-  useEffect(() => {
-    let ignore = false;
-    (async () => {
-      try {
-        const p = await api.provider(address);
-        if (ignore) return;
-        setProvider(p);
-        const first = p.services.find((s) => s.active !== false);
-        if (first) {
-          setSelected(first);
-          setAmount(toAmountInput(first.price));
-        }
-      } catch (err) {
-        if (ignore) return;
-        // An unknown clinic is a missing page, not an API failure.
-        if (err instanceof ApiError && err.status === 404) {
-          setMissingAddress(address);
-          return;
-        }
-        setLoadError(err instanceof Error ? err.message : 'Failed to load clinic');
-      }
-    })();
-    return () => {
-      ignore = true;
-    };
-  }, [address]);
+  // A custom expiry is described by the date it resolves to, so the funder
+  // reads the voucher's last valid day rather than the picker's raw value.
+  const customExpiresAt =
+    expiryChoice === 'custom' ? expiresAtFor('custom', customExpiry) : null;
+  const expirySummary =
+    expiryChoice === 'custom'
+      ? customExpiresAt === null
+        ? 'the end of the date you choose'
+        : `the end of ${formatDate(new Date(customExpiresAt * 1000))}`
+      : `${expiryChoice} days`;
 
   async function fund() {
     if (!wallet) return void connect();
     if (!selected) return;
 
     setBusy(true);
-    setError(null);
-    setTxHash(null);
-    setFundedId(null);
     try {
       const ref = await beneficiaryRef(identifier, secret);
-      localIdentity.save(identifier, secret);
+      localIdentity.save(saved.selectedNickname || 'Saved patient', identifier, secret);
 
       const base = toBaseUnits(amount);
       if (base < BigInt(selected.price)) {
@@ -125,7 +161,15 @@ export default function ClinicPage({
         );
       }
 
-      const expiresAt = Math.floor(Date.now() / 1000) + expiryDays * 24 * 60 * 60;
+      // A preset window is counted from now; a custom date is the last second
+      // of the day the funder picked.
+      const expiresAt = expiresAtFor(expiryChoice, customExpiry);
+      if (expiresAt === null) {
+        throw new Error('Choose the date the patient must attend by.');
+      }
+      if (expiresAt <= Math.floor(Date.now() / 1000)) {
+        throw new Error('The expiry date must be in the future.');
+      }
 
       const res = await voucher.create(
         {
@@ -138,36 +182,89 @@ export default function ClinicPage({
         },
         signTransaction,
       );
-      setTxHash(res.hash);
       // create_voucher returns the new id as a u64.
+      let newId: string | null = null;
       if (typeof res.returnValue === 'bigint' || typeof res.returnValue === 'number') {
-        setFundedId(String(res.returnValue));
+        newId = String(res.returnValue);
+        void invalidateVouchers(newId);
+      } else {
+        void invalidateVouchers();
       }
       trackEvent('voucher_funded');
+      toast.success(
+        <>
+          Voucher funded.{' '}
+          {newId && (
+            <>
+              <Link href={`/vouchers/${newId}`} className="underline underline-offset-2">
+                Open voucher #{newId}
+              </Link>{' '}
+              ·{' '}
+            </>
+          )}
+          <ExplorerLink href={explorerTx(res.hash)}>View transaction</ExplorerLink>
+        </>,
+      );
     } catch (err) {
-      setError(humaniseError(err, VOUCHER_ERRORS));
+      toast.error(humaniseError(err, VOUCHER_ERRORS));
     } finally {
       setBusy(false);
     }
   }
 
-  // Called while rendering (not from the effect) so Next can swap in
-  // not-found.tsx; throwing inside the async callback would be uncaught.
-  if (missingAddress === address) notFound();
+  // An unknown clinic is a missing page, not an API failure.
+  if (loadRawError instanceof ApiError && loadRawError.status === 404) notFound();
   if (loadError) return <Alert>{loadError}</Alert>;
   if (!provider) {
     return <p className="text-sm text-[var(--color-ink-soft)]">Loading clinic…</p>;
   }
 
+  const status = STATUS_BADGES[provider.status] ?? UNKNOWN_STATUS;
+  const registeredAt = Number.isFinite(new Date(provider.registeredAt).getTime())
+    ? provider.registeredAt
+    : null;
+  const showSettled = !loadingSettled && !settledError;
+
   return (
     <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
       <div className="space-y-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{provider.name}</h1>
-          <p className="mono mt-1 text-xs text-[var(--color-ink-soft)]">
-            {provider.country} · {shortAddress(provider.address, 8)}
-          </p>
-        </div>
+        <Card className="p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0">
+              <h1 className="text-2xl font-semibold tracking-tight">{provider.name}</h1>
+              <p className="mono mt-1 text-xs text-[var(--color-ink-soft)]">
+                {provider.country} ·{' '}
+                <CopyValue value={provider.address} chars={8} label="clinic address" />
+              </p>
+            </div>
+            <span
+              className={`inline-flex shrink-0 rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset ${status.className}`}
+            >
+              {status.label}
+            </span>
+          </div>
+
+          {(registeredAt || showSettled) && (
+            <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-[var(--color-line)] pt-4 sm:grid-cols-3">
+              {registeredAt && (
+                <div>
+                  <dt className="text-xs uppercase tracking-wide text-[var(--color-ink-soft)]">
+                    Registered
+                  </dt>
+                  <dd className="mt-0.5 text-sm">{formatDate(registeredAt)}</dd>
+                </div>
+              )}
+              {showSettled && (
+                <div>
+                  <dt className="text-xs uppercase tracking-wide text-[var(--color-ink-soft)]">
+                    Vouchers settled
+                  </dt>
+                  <dd className="mt-0.5 text-sm tabular-nums">{settledCount}</dd>
+                </div>
+              )}
+            </dl>
+          )}
+        </Card>
 
         <Card className="divide-y divide-[var(--color-line)]">
           {provider.services
@@ -176,8 +273,8 @@ export default function ClinicPage({
               <button
                 key={s.code}
                 onClick={() => {
-                  setSelected(s);
-                  setAmount(toAmountInput(s.price));
+                  setSelectedOverride(s);
+                  setAmountOverride(toAmountInput(s.price));
                 }}
                 className={`flex w-full items-center justify-between px-5 py-4 text-left transition hover:bg-[var(--color-canvas)] ${
                   selected?.code === s.code ? 'bg-[var(--color-brand-soft)]/40' : ''
@@ -209,11 +306,20 @@ export default function ClinicPage({
           </p>
         )}
 
-        {selected && (
+        {selected && !reviewing && (
           <>
             <Field label="Service">
               {selected.label} · ${formatUsdc(selected.price)}
             </Field>
+
+            <SavedPatientControls
+              identifier={identifier}
+              keyValue={secret}
+              onSelect={(patient) => {
+                setIdentifier(patient?.identifier ?? '');
+                setSecret(patient?.key ?? '');
+              }}
+            />
 
             <label className="block">
               <span className="text-xs uppercase tracking-wide text-[var(--color-ink-soft)]">
@@ -260,9 +366,9 @@ export default function ClinicPage({
 
             {generatedKey && (
               <Alert kind="info">
-                Save this key somewhere safe and share it with the patient or their
-                clinic. It is the only way to look up this patient&apos;s care history
-                later, and it cannot be recovered.
+                This key is the only way to look up this patient&apos;s care history
+                later. Save the patient on this browser or keep a separate backup;
+                the key cannot be recovered.
               </Alert>
             )}
 
@@ -272,7 +378,7 @@ export default function ClinicPage({
               </span>
               <input
                 value={amount}
-                onChange={(e) => setAmount(e.target.value)}
+                onChange={(e) => setAmountOverride(e.target.value)}
                 inputMode="decimal"
                 className="mono mt-1 w-full rounded-lg border border-[var(--color-line)] px-3 py-2 text-sm"
               />
@@ -289,8 +395,8 @@ export default function ClinicPage({
                 Patient must attend within
               </span>
               <select
-                value={expiryDays}
-                onChange={(e) => setExpiryDays(Number(e.target.value))}
+                value={expiryChoice}
+                onChange={(e) => setExpiryChoice(e.target.value as ExpiryChoice)}
                 className="mt-1 w-full rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] px-3 py-2 text-sm"
               >
                 {EXPIRY_OPTIONS.map((d) => (
@@ -298,39 +404,119 @@ export default function ClinicPage({
                     {d} days
                   </option>
                 ))}
+                <option value="custom">Custom date</option>
               </select>
             </label>
 
-            <TestUsdc compact />
-
-            {error && <Alert>{error}</Alert>}
-
-            {txHash && (
-              <Alert kind="success">
-                Voucher funded.{' '}
-                {fundedId && (
-                  <>
-                    <Link href={`/vouchers/${fundedId}`} className="underline underline-offset-2">
-                      Open voucher #{fundedId}
-                    </Link>{' '}
-                    ·{' '}
-                  </>
-                )}
-                <ExplorerLink href={explorerTx(txHash)}>View transaction</ExplorerLink>
-              </Alert>
+            {expiryChoice === 'custom' && (
+              <div>
+                <label className="block">
+                  <span className="text-xs uppercase tracking-wide text-[var(--color-ink-soft)]">
+                    Expiry date
+                  </span>
+                  <input
+                    type="date"
+                    value={customExpiry}
+                    min={minExpiryDate()}
+                    onChange={(e) => setCustomExpiry(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-[var(--color-line)] px-3 py-2 text-sm"
+                  />
+                </label>
+                <span className="mt-1 block text-xs text-[var(--color-ink-soft)]">
+                  The voucher is valid through this date (UTC). The contract
+                  accepts any date in the future.
+                </span>
+              </div>
             )}
 
-            <Button onClick={() => void fund()} disabled={busy} className="w-full">
+            <TestUsdc compact />
+
+            <Button
+              onClick={() => {
+                if (!wallet) {
+                  connect();
+                  return;
+                }
+                setReviewing(true);
+              }}
+              disabled={busy}
+              className="w-full"
+            >
               {busy ? 'Confirming…' : wallet ? 'Fund voucher' : 'Connect wallet'}
             </Button>
 
             <p className="text-xs leading-relaxed text-[var(--color-ink-soft)]">
               Funds are escrowed by the contract at{' '}
-              {shortAddress(config.contracts.voucher, 4)} and released to the clinic
-              only after an attester confirms delivery. Unclaimed vouchers are
-              refundable after {expiryDays} days.
+              <CopyValue
+                value={config.contracts.voucher}
+                chars={4}
+                label="contract id"
+              />{' '}
+              and released to the clinic only after an attester confirms delivery.
+              Unclaimed vouchers are refundable after {expirySummary}.
             </p>
           </>
+        )}
+
+        {selected && reviewing && (
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-lg font-medium">Review funding</h3>
+              <p className="mt-1 text-sm text-[var(--color-ink-soft)]">
+                Check the details below before signing the voucher.
+              </p>
+            </div>
+
+            <dl className="space-y-3 rounded-xl border border-[var(--color-line)] bg-[var(--color-canvas)] p-4 text-sm">
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Clinic</dt>
+                <dd className="text-right font-medium">{provider.name}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Service</dt>
+                <dd className="text-right font-medium">
+                  {selected.label} · ${formatUsdc(selected.price)}
+                </dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Patient reference</dt>
+                <dd className="text-right font-medium">{identifier || 'Not set'}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Patient key</dt>
+                <dd className="mono text-right font-medium">{maskedSecret}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Amount</dt>
+                <dd className="mono text-right font-medium">${reviewAmount}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Protocol fee</dt>
+                <dd className="mono text-right font-medium">${reviewFee}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Clinic payout</dt>
+                <dd className="mono text-right font-medium">${reviewNet}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Expires</dt>
+                <dd className="text-right font-medium">{expirySummary}</dd>
+              </div>
+            </dl>
+
+            <div className="flex gap-2">
+              <Button variant="ghost" className="flex-1" onClick={() => setReviewing(false)}>
+                Back
+              </Button>
+              <Button
+                className="flex-1"
+                onClick={() => void fund()}
+                disabled={busy}
+              >
+                {busy ? 'Confirming…' : 'Confirm'}
+              </Button>
+            </div>
+          </div>
         )}
       </Card>
     </div>

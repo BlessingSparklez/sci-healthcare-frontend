@@ -1,3 +1,5 @@
+import { config } from './config';
+
 /**
  * Contract error codes, mirrored from the Rust `#[contracterror]` enums.
  *
@@ -70,7 +72,9 @@ export function humaniseError(
   const code = contractErrorCode(message);
   if (code !== null) return table[code] ?? `Contract rejected this (error #${code}).`;
   if (/account not found/i.test(message)) {
-    return 'This account does not exist on the network yet. Fund it first.';
+    return config.network === 'testnet'
+      ? 'This account does not exist on the network yet. Fund it with Friendbot first.'
+      : 'This account does not exist on the network yet. Fund it first.';
   }
   return message;
 }

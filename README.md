@@ -49,7 +49,7 @@ Contract ids are already in `vercel.json`. Vercel will prompt for one variable,
 
 | Route | Who it is for | What it does |
 | --- | --- | --- |
-| `/` | Anyone | Verified clinic directory with live service pricing |
+| `/` | Anyone | Verified clinic directory with live service pricing, plus a map view of clinics with published locations |
 | `/clinics/[address]` | Funders | Pick a service and fund a voucher |
 | `/my` | Funders and patients | Vouchers you funded; dispute, refund, settle; care history lookup |
 | `/clinic` | Clinics | Register, list services, mark patients seen |
@@ -111,6 +111,8 @@ Every one of these is inlined into the client bundle at **build** time.
 
 > If the deployed app still calls `localhost`, these were set in the host's **runtime** environment but not its **build** environment. Next inlines `NEXT_PUBLIC_*` at build time; setting them afterwards changes nothing. This is the single most common deployment failure for this shape of app.
 
+`NEXT_PUBLIC_STELLAR_NETWORK` also drives the header badge and every testnet-only feature through a single `isTestnet` helper (`src/lib/config.ts`). Setting it to `public` builds for mainnet: the badge reads **Mainnet**, and the faucet, its notices and the footer disclaimer are hidden.
+
 ## Analytics
 
 Usage analytics is cookieless [Plausible](https://plausible.io), behind `NEXT_PUBLIC_PLAUSIBLE_DOMAIN` — unset means no script loads and nothing is sent. Pageviews use normalized routes (`/clinics/[address]`, never the address), and funnel events (`voucher_funded`, `voucher_claimed`, `care_confirmed`, `dispute_opened`, `voucher_settled`, `voucher_refunded`) carry names only: no addresses, patient references, amounts or voucher ids ever leave the browser.
@@ -118,6 +120,59 @@ Usage analytics is cookieless [Plausible](https://plausible.io), behind `NEXT_PU
 ## Error reporting
 
 Uncaught errors are reported to [Sentry](https://sentry.io), behind `NEXT_PUBLIC_SENTRY_DSN` — unset means the SDK never initialises. Every report passes through a `beforeSend` scrubber (`src/lib/error-reporting.ts`) that normalizes dynamic routes and redacts 64-hex digests, Stellar addresses and sensitive query parameters, so patient references, secret keys and beneficiary hashes never leave the browser. Tracing and session replay stay off.
+
+## Security headers
+
+Every route is served with a Content-Security-Policy built in `next.config.ts`
+from the same build-time variables the client bundle reads, so the allow-list
+cannot drift from the origins the app actually calls: the indexer API, Soroban
+RPC, Horizon, the wallet hosts the SEP-43 kit talks to, OpenStreetMap tiles and
+the optional Plausible/Sentry origins. `frame-ancestors 'none'` (with
+`X-Frame-Options: DENY`), `Referrer-Policy: strict-origin-when-cross-origin`,
+`Permissions-Policy`, `X-Content-Type-Options: nosniff` and
+`Cross-Origin-Opener-Policy: same-origin-allow-popups` follow it.
+
+The policy is sent as `Content-Security-Policy-Report-Only` by default: run the
+app with a real wallet, watch the console for violations, then build with
+`CSP_ENFORCE=1` to enforce it. Headers are baked in at build time, so redeploy
+after changing the variable. Covered by `tests/e2e/security-headers.spec.ts`.
+
+## Low-bandwidth mode
+
+Clinic connections are often slow and metered, so the header carries a **Low
+data** switch, remembered per browser in `localStorage`. With it on:
+
+- live updates fall back from a held-open SSE stream to a 60s poll;
+- SWR stops revalidating on focus and reconnect;
+- the clinic map is not offered, so neither the Leaflet chunk nor any
+  OpenStreetMap tile is requested;
+- cookieless analytics is off: no script is loaded and no pageview is sent.
+
+Writes are untouched — contract calls are built, simulated, signed and
+submitted exactly as before — and error reporting stays on, because a failed
+transaction on a bad link is exactly when a report is worth its bytes.
+Measured on the home page with the map open: **748 KB → 438 KB** at 1280px and
+**562 KB → 409 KB** at 390px (`tests/e2e/low-bandwidth-mode.spec.ts` asserts
+the byte count and the traffic).
+
+## Installable app and offline shell
+
+The app ships a web app manifest (`src/app/manifest.ts`) and icons, so a phone
+can install it, and `public/sw.js` caches the shell — the `/` document, the
+manifest, the icons and the content-hashed build output — so it opens on a
+connection that is down and says plainly that it cannot reach the indexer.
+
+Nothing else is cached. The indexer API, Soroban RPC, Horizon, map tiles and
+analytics are cross-origin and pass straight through, and so do Next's
+same-origin RSC payloads, because those carry page content. A cached API answer
+would be a privacy leak on a shared clinic phone, and a wrong answer too: a
+voucher's state comes from the chain, not from yesterday's response.
+
+Icons are generated rather than hand-drawn (`npm run icons`,
+`scripts/generate-icons.mjs`) and checked in so a deployment needs no asset
+step. `tests/e2e/offline-shell.spec.ts` covers the manifest, the icons and the
+offline reload; the other suites block service workers
+(`playwright.config.ts`) so their network stays deterministic.
 
 ## Deploying
 

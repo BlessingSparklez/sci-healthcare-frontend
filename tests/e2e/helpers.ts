@@ -17,14 +17,22 @@ import type { MockRpcCall } from '@/lib/e2e-seam';
 declare global {
   interface Window {
     __SCI_MOCK_WALLET__?: { address: string };
-    __SCI_MOCK_RPC__?: { calls: MockRpcCall[] };
+    __SCI_MOCK_RPC__?: { calls: MockRpcCall[]; args: string[][]; delayMs?: number };
   }
 }
 
-export async function useMockWallet(page: Page, address: string): Promise<void> {
+/**
+ * `delayMs` keeps mocked writes in flight for that long, so a test can
+ * observe the unload guard during a pending transaction.
+ */
+export async function useMockWallet(
+  page: Page,
+  address: string,
+  delayMs = 0,
+): Promise<void> {
   await page.addInitScript(
     `window.__SCI_MOCK_WALLET__ = { address: '${address}' };
-     window.__SCI_MOCK_RPC__ = { calls: [] };`,
+     window.__SCI_MOCK_RPC__ = { calls: [], args: [], delayMs: ${delayMs} };`,
   );
   // The analytics script tag is present in the test build; keep the request
   // itself inside the sandbox. (The analytics spec stubs window.plausible,
@@ -34,12 +42,23 @@ export async function useMockWallet(page: Page, address: string): Promise<void> 
 
 export type BackendState = {
   provider?: Record<string, unknown>;
+  /** Several providers at once, e.g. for the map's located/unlocated split. */
+  providers?: Record<string, unknown>[];
   vouchers?: Record<string, unknown>[];
   voucherById?: Record<string, unknown>;
+  /**
+   * Per-voucher event log (`GET /vouchers/:id/events`, #18). An id left
+   * out answers 404, exactly like an indexer that predates backend #13 —
+   * the page then shows the timeline without transaction links.
+   */
+  voucherEventsById?: Record<string, unknown[]>;
+  dailyStats?: Record<string, unknown>;
+  attesters?: Record<string, unknown>[];
+  receipts?: { total: number; totalSpendDisplay: string; receipts: Record<string, unknown>[] };
 };
 
 export async function mockBackend(page: Page, state: BackendState): Promise<void> {
-  const providers = state.provider ? [state.provider] : [];
+  const providers = state.providers ?? (state.provider ? [state.provider] : []);
   await page.route('http://localhost:8080/**', (route) => {
     const url = new URL(route.request().url());
     const parts = url.pathname.split('/').filter(Boolean);
@@ -51,6 +70,23 @@ export async function mockBackend(page: Page, state: BackendState): Promise<void
       });
 
     if (parts[0] === 'stats') {
+      if (parts[1] === 'daily') {
+        return json(
+          state.dailyStats ?? {
+            days: 30,
+            from: '2026-05-16T00:00:00.000Z',
+            to: '2026-06-15T00:00:00.000Z',
+            series: [
+              {
+                date: '2026-06-01',
+                funded: { count: 4, amount: '120000000' },
+                settled: { count: 2, amount: '60000000' },
+                refunded: { count: 0, amount: '0' },
+              },
+            ],
+          },
+        );
+      }
       return json({
         providers: providers.length,
         activeProviders: providers.length,
@@ -61,8 +97,30 @@ export async function mockBackend(page: Page, state: BackendState): Promise<void
       });
     }
 
+    if (parts[0] === 'attesters') {
+      const attesters = state.attesters ?? [
+        {
+          address: 'GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAA',
+          active: true,
+          addedAt: '2026-01-15T10:00:00.000Z',
+          removedAt: null,
+          attestations: 14,
+          name: 'Red Cross Clinical Inspector',
+          organisation: 'International Medical Verification',
+        },
+      ];
+      return json({
+        total: attesters.length,
+        limit: 50,
+        offset: 0,
+        attesters,
+      });
+    }
+
     if (parts[0] === 'receipts') {
-      return json({ total: 0, totalSpendDisplay: '0.00', receipts: [] });
+      return json(
+        state.receipts ?? { total: 0, totalSpendDisplay: '0.00', receipts: [] },
+      );
     }
 
     if (parts[0] === 'providers') {
@@ -77,6 +135,12 @@ export async function mockBackend(page: Page, state: BackendState): Promise<void
     }
 
     if (parts[0] === 'vouchers') {
+      // /vouchers/<id>/events — per-step transaction hashes (#18).
+      if (parts.length === 3 && parts[2] === 'events') {
+        const events = state.voucherEventsById?.[parts[1]];
+        if (events) return json({ total: events.length, events });
+        return json({ message: 'Not found' }, 404);
+      }
       if (parts.length === 2) {
         const v = state.voucherById?.[parts[1]];
         if (v) return json(v);
@@ -93,4 +157,20 @@ export async function mockBackend(page: Page, state: BackendState): Promise<void
 export async function mockInvokes(page: Page): Promise<MockRpcCall[]> {
   const calls = await page.evaluate(() => window.__SCI_MOCK_RPC__?.calls ?? []);
   return calls.filter((c) => c.kind === 'invoke');
+}
+
+/**
+ * The arguments of those writes, as base64 XDR, in the same order: index `i`
+ * here is what `mockInvokes(page)[i]` carried. Lets a test assert a value the
+ * UI never shows — that the date a funder picked became the `expires_at` the
+ * contract was called with, for instance.
+ */
+export async function mockInvokeArgs(page: Page): Promise<string[][]> {
+  return page.evaluate(() => {
+    const mock = window.__SCI_MOCK_RPC__;
+    if (!mock) return [];
+    return mock.calls
+      .map((call, i) => (call.kind === 'invoke' ? mock.args[i] ?? [] : null))
+      .filter((args): args is string[] => args !== null);
+  });
 }

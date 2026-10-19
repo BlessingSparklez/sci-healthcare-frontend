@@ -1,8 +1,5 @@
 'use client';
 
-import { Networks, StellarWalletsKit } from '@creit.tech/stellar-wallets-kit';
-import { FREIGHTER_ID } from '@creit.tech/stellar-wallets-kit/modules/freighter';
-import { defaultModules } from '@creit.tech/stellar-wallets-kit/modules/utils';
 import {
   createContext,
   useCallback,
@@ -15,6 +12,14 @@ import {
 
 import { config } from './config';
 import { mockWalletAddress } from './e2e-seam';
+import {
+  PASSKEY_WALLET_ID,
+  PasskeyModule,
+  connectPasskeyWallet,
+  getStoredPasskeyAddress,
+  signWithPasskey,
+} from './passkey';
+import { checkAccountFunded, getAccountSpendableBalance } from './stellar';
 
 /**
  * Wallet connection.
@@ -23,67 +28,150 @@ import { mockWalletAddress } from './e2e-seam';
  * is signed inside the user's wallet and submitted from the browser
  * straight to Soroban RPC. The backend is not in the write path at all.
  *
+ * The wallet kit (~large) is split out of the initial bundle: read-only
+ * pages never download it. It loads on demand the first time the user
+ * connects, restores a previous session, or signs. A `sci-wallet-connected`
+ * flag in local storage avoids even the restore attempt on a first visit.
+ *
  * StellarWalletsKit v2 exposes a static, process-wide API rather than an
  * instance, so initialisation is guarded to run exactly once.
  */
 
-type WalletState = {
+export type WalletState = {
   address: string | null;
+  walletName: string | null;
   connecting: boolean;
+  isUnfunded: boolean;
+  isLowXlm: boolean;
+  spendableXlm: number | null;
   error: string | null;
-  connect: () => Promise<void>;
+  connect: (walletId?: string) => Promise<void>;
   disconnect: () => Promise<void>;
   signTransaction: (xdr: string) => Promise<string>;
 };
 
 const WalletContext = createContext<WalletState | null>(null);
 
-function networkFor(name: string): Networks {
-  switch (name) {
-    case 'public':
-      return Networks.PUBLIC;
-    case 'futurenet':
-      return Networks.FUTURENET;
-    default:
-      return Networks.TESTNET;
-  }
-}
+const CONNECTED_FLAG = 'sci-wallet-connected';
+const SELECTED_WALLET_ID_KEY = 'sci-wallet-id';
 
 let initialised = false;
+let initPromise: Promise<void> | null = null;
 
-function ensureInit(): void {
-  if (initialised || typeof window === 'undefined') return;
-  StellarWalletsKit.init({
-    modules: defaultModules(),
-    selectedWalletId: FREIGHTER_ID,
-    network: networkFor(config.network),
-  });
-  initialised = true;
+function getWalletDisplayName(id: string | null | undefined): string {
+  if (!id) return 'Connected Wallet';
+  if (id === PASSKEY_WALLET_ID) return 'Passkey Smart Wallet';
+  if (/freighter/i.test(id)) return 'Freighter';
+  if (/xbull/i.test(id)) return 'xBull Wallet';
+  if (/albedo/i.test(id)) return 'Albedo';
+  if (/lobstr/i.test(id)) return 'LOBSTR';
+  if (/rabet/i.test(id)) return 'Rabet';
+  if (/hana/i.test(id)) return 'Hana Wallet';
+  return id;
+}
+
+/** Loads the kit and initialises it exactly once. */
+function ensureInit(): Promise<void> {
+  if (initialised) return Promise.resolve();
+  if (initPromise) return initPromise;
+  initPromise = (async () => {
+    const [
+      { StellarWalletsKit, Networks },
+      { FREIGHTER_ID },
+      { defaultModules },
+    ] = await Promise.all([
+      import('@creit.tech/stellar-wallets-kit'),
+      import('@creit.tech/stellar-wallets-kit/modules/freighter'),
+      import('@creit.tech/stellar-wallets-kit/modules/utils'),
+    ]);
+    const network =
+      config.network === 'public'
+        ? Networks.PUBLIC
+        : config.network === 'futurenet'
+          ? Networks.FUTURENET
+          : Networks.TESTNET;
+    StellarWalletsKit.init({
+      modules: [
+        new PasskeyModule() as unknown as import('@creit.tech/stellar-wallets-kit').ModuleInterface,
+        ...defaultModules(),
+      ],
+      selectedWalletId: FREIGHTER_ID,
+      network,
+    });
+    initialised = true;
+  })();
+  return initPromise;
+}
+
+async function getKit() {
+  await ensureInit();
+  const { StellarWalletsKit } = await import('@creit.tech/stellar-wallets-kit');
+  return StellarWalletsKit;
 }
 
 export function WalletProvider({ children }: { children: ReactNode }) {
   const [address, setAddress] = useState<string | null>(null);
+  const [walletName, setWalletName] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
+  const [isUnfunded, setIsUnfunded] = useState(false);
+  const [isLowXlm, setIsLowXlm] = useState(false);
+  const [spendableXlm, setSpendableXlm] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Restore a previous session silently. The kit keeps its own selection in
-  // storage; if the wallet is locked or was revoked this simply fails and
-  // the user sees the connect button. Playwright end-to-end tests inject
-  // window.__SCI_MOCK_WALLET__ instead (see e2e-seam.ts) and skip the kit.
+  // Restore a previous session silently (#59).
   useEffect(() => {
     let cancelled = false;
     (async () => {
       const mocked = mockWalletAddress();
       if (mocked) {
-        if (!cancelled) setAddress(mocked);
+        if (!cancelled) {
+          setAddress(mocked);
+          setWalletName('Mock Wallet');
+        }
         return;
       }
-      ensureInit();
       try {
-        const { address: addr } = await StellarWalletsKit.getAddress();
-        if (!cancelled && addr) setAddress(addr);
+        if (
+          typeof window !== 'undefined' &&
+          window.localStorage.getItem(CONNECTED_FLAG) !== '1'
+        ) {
+          return;
+        }
       } catch {
-        // Not connected yet. Expected on a first visit.
+        return;
+      }
+
+      const savedWalletId = (() => {
+        try {
+          return window.localStorage.getItem(SELECTED_WALLET_ID_KEY);
+        } catch {
+          return null;
+        }
+      })();
+
+      if (savedWalletId === PASSKEY_WALLET_ID) {
+        const passkeyAddr = getStoredPasskeyAddress();
+        if (!cancelled && passkeyAddr) {
+          setAddress(passkeyAddr);
+          setWalletName('Passkey Smart Wallet');
+        }
+        return;
+      }
+
+      try {
+        const kit = await getKit();
+        if (savedWalletId) {
+          kit.setWallet(savedWalletId);
+        }
+        const { address: addr } = await kit.getAddress();
+        if (!cancelled && addr) {
+          setAddress(addr);
+          setWalletName(
+            getWalletDisplayName(savedWalletId || kit.selectedModule?.productId),
+          );
+        }
+      } catch {
+        // Not connected yet or wallet locked.
       }
     })();
     return () => {
@@ -91,21 +179,83 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const connect = useCallback(async () => {
+  // Check if connected account exists on network (#60) and has enough XLM for fees (#61).
+  useEffect(() => {
+    if (!address) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [funded, spendableInfo] = await Promise.all([
+          checkAccountFunded(address),
+          getAccountSpendableBalance(address),
+        ]);
+        if (!cancelled) {
+          setIsUnfunded(!funded);
+          if (spendableInfo) {
+            setIsLowXlm(spendableInfo.isLowForFees);
+            setSpendableXlm(spendableInfo.spendable);
+          } else {
+            setIsLowXlm(false);
+            setSpendableXlm(null);
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          setIsUnfunded(false);
+          setIsLowXlm(false);
+          setSpendableXlm(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [address]);
+
+  const connect = useCallback(async (walletId?: string) => {
     const mocked = mockWalletAddress();
     if (mocked) {
       setAddress(mocked);
+      setWalletName('Mock Wallet');
       return;
     }
-    ensureInit();
     setConnecting(true);
     setError(null);
     try {
-      const { address: addr } = await StellarWalletsKit.authModal();
+      let addr: string | null = null;
+      let selectedId: string | null = null;
+
+      if (walletId === PASSKEY_WALLET_ID) {
+        const passkey = await connectPasskeyWallet();
+        addr = passkey.address;
+        selectedId = PASSKEY_WALLET_ID;
+      } else {
+        const kit = await getKit();
+        if (walletId) {
+          kit.setWallet(walletId);
+          const res = await kit.getAddress();
+          addr = res.address;
+          selectedId = walletId;
+        } else {
+          const res = await kit.authModal();
+          addr = res.address;
+          selectedId = kit.selectedModule?.productId || null;
+        }
+      }
+
       setAddress(addr);
+      setWalletName(getWalletDisplayName(selectedId));
+
+      try {
+        window.localStorage.setItem(CONNECTED_FLAG, '1');
+        if (selectedId) {
+          window.localStorage.setItem(SELECTED_WALLET_ID_KEY, selectedId);
+        }
+      } catch {
+        // Storage may be unavailable
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      // Closing the modal is a normal action, not an error worth showing.
       if (!/closed|cancel/i.test(message)) setError(message);
     } finally {
       setConnecting(false);
@@ -114,20 +264,49 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
   const disconnect = useCallback(async () => {
     try {
-      if (!mockWalletAddress()) await StellarWalletsKit.disconnect();
+      if (typeof window !== 'undefined') {
+        delete (window as unknown as { __SCI_MOCK_WALLET__?: unknown }).__SCI_MOCK_WALLET__;
+      }
+      try {
+        const kit = await getKit();
+        await kit.disconnect();
+      } catch {
+        // The kit may never have loaded
+      }
+      try {
+        window.localStorage.removeItem(CONNECTED_FLAG);
+        window.localStorage.removeItem(SELECTED_WALLET_ID_KEY);
+      } catch {
+        // Ignore storage failures
+      }
     } finally {
       setAddress(null);
+      setWalletName(null);
+      setIsUnfunded(false);
+      setIsLowXlm(false);
+      setSpendableXlm(null);
     }
   }, []);
 
   const signTransaction = useCallback(
     async (xdr: string) => {
       if (!address) throw new Error('Connect a wallet first');
-      // Test signer: echoes the transaction back. The RPC mock (when present)
-      // accepts it without submission; without the RPC mock the network
-      // rejects it, so this can never sign a real transaction.
       if (mockWalletAddress()) return xdr;
-      const { signedTxXdr } = await StellarWalletsKit.signTransaction(xdr, {
+
+      const savedWalletId = (() => {
+        try {
+          return window.localStorage.getItem(SELECTED_WALLET_ID_KEY);
+        } catch {
+          return null;
+        }
+      })();
+
+      if (savedWalletId === PASSKEY_WALLET_ID || address.startsWith('C')) {
+        return signWithPasskey(xdr);
+      }
+
+      const kit = await getKit();
+      const { signedTxXdr } = await kit.signTransaction(xdr, {
         address,
         networkPassphrase: config.networkPassphrase,
       });
@@ -137,11 +316,35 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ address, connecting, error, connect, disconnect, signTransaction }),
-    [address, connecting, error, connect, disconnect, signTransaction],
+    () => ({
+      address,
+      walletName,
+      connecting,
+      isUnfunded,
+      isLowXlm,
+      spendableXlm,
+      error,
+      connect,
+      disconnect,
+      signTransaction,
+    }),
+    [
+      address,
+      walletName,
+      connecting,
+      isUnfunded,
+      isLowXlm,
+      spendableXlm,
+      error,
+      connect,
+      disconnect,
+      signTransaction,
+    ],
   );
 
-  return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>;
+  return (
+    <WalletContext.Provider value={value}>{children}</WalletContext.Provider>
+  );
 }
 
 export function useWallet(): WalletState {

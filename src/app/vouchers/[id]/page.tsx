@@ -2,58 +2,52 @@
 
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
-import { use, useCallback, useEffect, useState } from 'react';
+import { use, useState } from 'react';
 
-import { api, ApiError, type Receipt, type Voucher } from '@/lib/api';
-import { formatDate, formatUsdc, shortAddress } from '@/lib/amounts';
-import { config, explorerContract } from '@/lib/config';
-import { voucherTimeline, type StepState } from '@/lib/timeline';
+import { ApiError } from '@/lib/api';
+import { formatDate, formatUsdc } from '@/lib/amounts';
+import { config, explorerContract, explorerTx } from '@/lib/config';
+import { useLiveUpdates, useNameIndex, useNow, useVoucher, useVoucherEvents } from '@/lib/hooks';
+import { stepTxHashes, voucherTimeline, type StepState } from '@/lib/timeline';
 import { useWallet } from '@/lib/wallet';
+import { CopyValue } from '@/components/CopyValue';
 import { VoucherRow } from '@/components/VoucherRow';
 import { Alert, Card, ExplorerLink, Field, StatusBadge } from '@/components/ui';
-
-type Loaded = Voucher & { receipt: Receipt | null };
 
 /**
  * One voucher, end to end: what it pays for, where it is in its lifecycle,
  * and the receipt once it settles. Shareable by link; everything shown is
  * already public on the ledger.
+ *
+ * Uses SWR caching (#63) and live updates via SSE with polling fallback (#64).
  */
 export default function VoucherPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const { address } = useWallet();
-  const [v, setV] = useState<Loaded | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  // The id the API reported as missing, so a later id is never hidden by it.
-  const [missingId, setMissingId] = useState<string | null>(null);
+  const now = useNow();
+  const names = useNameIndex();
+  const [copied, setCopied] = useState(false);
 
-  const [reloads, setReloads] = useState(0);
-  const refresh = useCallback(() => setReloads((n) => n + 1), []);
+  async function copyLink() {
+    try {
+      const url = typeof window !== 'undefined' ? window.location.href : '';
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard write failed
+    }
+  }
 
-  useEffect(() => {
-    let ignore = false;
-    (async () => {
-      try {
-        const res = await api.voucher(id);
-        if (!ignore) setV(res);
-      } catch (err) {
-        if (ignore) return;
-        // A mistyped shared link is a missing page, not an API failure.
-        if (err instanceof ApiError && err.status === 404) {
-          setMissingId(id);
-          return;
-        }
-        setError(err instanceof Error ? err.message : 'Failed to load voucher');
-      }
-    })();
-    return () => {
-      ignore = true;
-    };
-  }, [id, reloads]);
+  const { voucher: v, error, rawError, mutate } = useVoucher(id);
+  // Per-step transaction hashes (#18). An indexer without the events
+  // endpoint (backend #13) yields an empty list and the history renders
+  // exactly as before, only without the "view transaction" links.
+  const { events } = useVoucherEvents(id);
+  useLiveUpdates({ voucherId: id });
 
-  // Called while rendering (not from the effect) so Next can swap in
-  // not-found.tsx; throwing inside the async callback would be uncaught.
-  if (missingId === id) notFound();
+  // An unknown voucher number is a missing page, not an API failure.
+  if (rawError instanceof ApiError && rawError.status === 404) notFound();
   if (error) return <Alert>{error}</Alert>;
   if (!v) return <p className="text-sm text-[var(--color-ink-soft)]">Loading voucher…</p>;
 
@@ -66,15 +60,42 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
         ? (['claim', 'settle'] as const)
         : (['settle', 'refund'] as const);
 
-  const steps = voucherTimeline(v, v.receipt);
+  const steps = voucherTimeline(v, v.receipt, now, stepTxHashes(events));
 
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="mono text-xs text-[var(--color-ink-soft)]">Voucher #{v.id}</span>
             <StatusBadge status={v.status} />
+            <button
+              type="button"
+              onClick={() => void copyLink()}
+              className="inline-flex items-center gap-1 rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] px-2 py-0.5 text-xs font-medium text-[var(--color-ink-soft)] transition hover:border-[var(--color-brand)] hover:text-[var(--color-ink)]"
+              aria-label="Copy link"
+            >
+              {copied ? (
+                <span className="font-medium text-emerald-700">Link copied!</span>
+              ) : (
+                <>
+                  <svg
+                    aria-hidden="true"
+                    className="h-3 w-3"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  </svg>
+                  <span>Copy link</span>
+                </>
+              )}
+            </button>
           </div>
           <h1 className="mt-1 text-xl font-semibold tracking-tight">
             {v.serviceLabel ?? `Service ${v.serviceCode}`}
@@ -111,6 +132,14 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
                   <div className="text-xs text-[var(--color-ink-soft)]">
                     {s.detail}
                     {s.at && ` · ${formatDate(s.at)}`}
+                    {s.txHash && (
+                      <>
+                        {' · '}
+                        <ExplorerLink href={explorerTx(s.txHash)}>
+                          View transaction
+                        </ExplorerLink>
+                      </>
+                    )}
                   </div>
                 </div>
               </li>
@@ -120,7 +149,7 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
 
         <Card className="space-y-4 p-5">
           <Field label="Funded by">
-            <span className="mono">{shortAddress(v.funder)}</span>
+            <CopyValue value={v.funder} name={names.get(v.funder)} label="funder address" />
           </Field>
           <Field label="Expires">{formatDate(v.expiresAt)}</Field>
           {v.status === 'Settled' && v.settledNet && (
@@ -134,11 +163,23 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
               )}
             </Field>
           )}
+          {v.disputeOutcome && (
+            <Field label="Dispute outcome">
+              <span className="font-medium">
+                {v.disputeOutcome}
+                {v.disputeResolvedAt && ` · ${formatDate(v.disputeResolvedAt)}`}
+              </span>
+            </Field>
+          )}
           {v.receipt && (
             <Field label="Care receipt">Minted {formatDate(v.receipt.settledAt)}</Field>
           )}
           <Field label="Patient reference">
-            <span className="mono text-xs">{v.beneficiaryRef.slice(0, 16)}…</span>
+            <CopyValue
+              value={v.beneficiaryRef}
+              display={`${v.beneficiaryRef.slice(0, 16)}…`}
+              label="patient reference"
+            />
           </Field>
           <p className="text-xs text-[var(--color-ink-soft)]">
             The patient reference is an opaque hash. It cannot be turned back into a
@@ -150,7 +191,14 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
         </Card>
       </div>
 
-      <VoucherRow v={v} actions={[...actions]} onDone={refresh} summary={false} />
+      <VoucherRow
+        v={v}
+        actions={[...actions]}
+        onDone={() => {
+          void mutate();
+        }}
+        summary={false}
+      />
     </div>
   );
 }

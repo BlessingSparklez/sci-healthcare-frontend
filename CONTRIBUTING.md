@@ -22,6 +22,11 @@ npm run typecheck
 npm run build
 ```
 
+`npm run build` is a production build, so it checks the required
+`NEXT_PUBLIC_*` values first and stops with an itemised message when one is
+missing (see `next.config.ts`, #76). Fill in `.env.local` before building —
+`next dev` and Storybook are not affected by that check.
+
 ## Non-negotiables
 
 - **Non-custodial, always.** The app must never hold, request, or transmit a
@@ -75,6 +80,7 @@ fix(wallet): restore session after the kit rotates its storage key
 A bot merges pull requests automatically (squash) as soon as every CI check on the latest commit has passed, provided the pull request:
 
 - is not a draft and has no `do-not-merge` label,
+- links the issue you were assigned on Drips Wave, with a line such as `Closes #123` in the description (Wave points are awarded when that issue is closed as completed, which the bot does on merge),
 - has no merge conflicts and is up to date with `main` (the bot comments if it is behind),
 - and, if it changes anything under `.github/` (CI workflows and repository automation), has been approved by a maintainer. The bot comments with the files that need approval.
 
