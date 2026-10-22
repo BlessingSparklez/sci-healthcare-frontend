@@ -12,6 +12,7 @@ import { ToastProvider } from '@/components/Toast';
 import { SiteHeader } from '@/components/SiteHeader';
 import { WalletProvider } from '@/lib/wallet';
 import { config, isTestnet } from '@/lib/config';
+import { wakeBannerShown } from '@/lib/api';
 
 import { LocaleProvider } from '@/i18n/LocaleContext';
 import { LanguageSwitcher } from '@/components/LanguageSwitcher';
@@ -69,6 +70,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         {config.plausibleDomain ? <Analytics domain={config.plausibleDomain} /> : null}
         <ErrorReporter />
+        {wakeBannerShown && (
+          <div role="alert" className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 bg-[--color-brand] text-[--color-on-brand] px-4 py-3 rounded text-sm max-w-sm animate-fade-in">
+            Starting the server, this can take up to a minute.
+          </div>
+        )}
         <PendingTransactionGuard />
         <ServiceWorkerRegistration />
         <WalletProvider>
